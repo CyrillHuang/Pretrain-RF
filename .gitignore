@@ -1,0 +1,8 @@
+# Ignore generated files and local artifacts
+__pycache__/
+*.py[cod]
+result/
+logs/
+checkpoints/*.pth
+checkpoints/*.pt
+checkpoints/*.ckpt
