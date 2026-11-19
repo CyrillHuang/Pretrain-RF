@@ -138,10 +138,6 @@ def new_gate_meter():
 def set_mode(modules, train=True):
     for module in modules:
         module.train(train)
-def set_requires_grad(modules, requires_grad):
-    for module in modules:
-        for param in module.parameters():
-            param.requires_grad = requires_grad
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -463,20 +459,6 @@ class LargeCleanGenEncoderZGuidedIIN(nn.Module):
 
 
 def build_optimizer(args, models, projector, token_projector, clean_gen_encoder, classifier):
-    if args.freeze_encoder:
-        downstream_params = list(projector.parameters()) + list(token_projector.parameters())
-        if clean_gen_encoder is not None:
-            downstream_params.extend(clean_gen_encoder.parameters())
-        return torch.optim.AdamW(
-            [
-                # These modules are loaded from the pre-training checkpoint.
-                {"params": downstream_params, "lr": args.lr},
-                # The classifier/fusion head is initialized for downstream HAR.
-                {"params": classifier.parameters(), "lr": args.head_lr},
-            ],
-            weight_decay=args.weight_decay,
-        )
-
     pretrained_params = []
     for model in models:
         pretrained_params.extend(model.parameters())
@@ -492,44 +474,6 @@ def build_optimizer(args, models, projector, token_projector, clean_gen_encoder,
         ],
         weight_decay=args.weight_decay,
     )
-
-
-def audit_freeze_configuration(
-    args,
-    models,
-    projector,
-    token_projector,
-    clean_gen_encoder,
-    classifier,
-    optimizer,
-):
-    """Fail loudly if a frozen backbone can still be updated by the optimizer."""
-    backbone_params = [param for model in models for param in model.parameters()]
-    optimizer_param_ids = {
-        id(param)
-        for group in optimizer.param_groups
-        for param in group["params"]
-    }
-    trainable_backbone = sum(param.requires_grad for param in backbone_params)
-    optimizer_backbone = sum(id(param) in optimizer_param_ids for param in backbone_params)
-    downstream_modules = [projector, token_projector, classifier]
-    if clean_gen_encoder is not None:
-        downstream_modules.append(clean_gen_encoder)
-    downstream_params = [param for module in downstream_modules for param in module.parameters()]
-    trainable_downstream = sum(param.requires_grad for param in downstream_params)
-
-    print(
-        f"freeze audit: backbone_params={len(backbone_params)} "
-        f"trainable_backbone={trainable_backbone} "
-        f"optimizer_backbone={optimizer_backbone} "
-        f"trainable_downstream={trainable_downstream}"
-    )
-
-    if args.freeze_encoder:
-        if trainable_backbone != 0:
-            raise RuntimeError("freeze audit failed: some backbone parameters still require gradients")
-        if optimizer_backbone != 0:
-            raise RuntimeError("freeze audit failed: frozen backbone parameters are present in the optimizer")
 
 
 def forward_logits(
@@ -568,17 +512,10 @@ def train_one_epoch(
     optimizer,
     criterion,
 ):
-    encoder_modules = [*models, projector, token_projector]
+    modules = [*models, projector, token_projector, classifier]
     if clean_gen_encoder is not None:
-        encoder_modules.append(clean_gen_encoder)
-    if args.freeze_encoder:
-        # Freeze only the three modality ResNet backbones. Projection, token,
-        # shared-generation, and IIN classifier layers remain trainable.
-        set_mode(models, train=False)
-        set_mode([projector, token_projector, *([] if clean_gen_encoder is None else [clean_gen_encoder])], train=True)
-        set_mode([classifier], train=True)
-    else:
-        set_mode([*encoder_modules, classifier], train=True)
+        modules.append(clean_gen_encoder)
+    set_mode(modules, train=True)
 
     total_loss = 0.0
     total_correct = 0
@@ -591,29 +528,19 @@ def train_one_epoch(
         samples_mmwave = samples_mmwave.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        if args.freeze_encoder:
-            # Backbone parameters have requires_grad=False; projector and all
-            # downstream modules still receive gradients.
-            model_zs, wifi_map, rfid_map, mmwave_map = forward_backbone_outputs(
-                models, projector, samples_wifi, samples_rfid, samples_mmwave
+        logits, gate = split_logits_gate(
+            forward_logits(
+                models,
+                projector,
+                token_projector,
+                clean_gen_encoder,
+                classifier,
+                samples_wifi,
+                samples_rfid,
+                samples_mmwave,
+                return_g=args.return_g,
             )
-            raw_tokens = token_projector(wifi_map, rfid_map, mmwave_map)
-            encoded_tokens = clean_gen_encoder(raw_tokens) if clean_gen_encoder is not None else raw_tokens
-            logits, gate = split_logits_gate(classifier(model_zs, encoded_tokens, return_g=args.return_g))
-        else:
-            logits, gate = split_logits_gate(
-                forward_logits(
-                    models,
-                    projector,
-                    token_projector,
-                    clean_gen_encoder,
-                    classifier,
-                    samples_wifi,
-                    samples_rfid,
-                    samples_mmwave,
-                    return_g=args.return_g,
-                )
-            )
+        )
 
         loss = criterion(logits, labels)
         optimizer.zero_grad(set_to_none=True)
@@ -802,7 +729,6 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--label_smoothing", type=float, default=0.0)
-    parser.add_argument("--freeze_encoder", action="store_true")
     parser.add_argument("--z_hidden_dim", type=int, default=None)
     parser.add_argument("--sharing_num", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -825,8 +751,6 @@ def parse_args():
         parser.error("--no_pretrain cannot be used with --pretrain_ckpt")
     if not args.no_pretrain and not args.pretrain_ckpt:
         parser.error("provide --pretrain_ckpt, or use --no_pretrain for a random-initialization baseline")
-    if args.no_pretrain and args.freeze_encoder:
-        parser.error("--freeze_encoder is invalid with --no_pretrain")
     return args
 
 
@@ -886,21 +810,7 @@ def main():
         add_iin_modality_embed=args.add_iin_modality_embed,
     ).to(device)
 
-    if args.freeze_encoder:
-        # Only freeze the three modality backbones. The projector, token
-        # projector, shared encoder, and IIN classifier remain trainable.
-        set_requires_grad(models, False)
-
     optimizer = build_optimizer(args, models, projector, token_projector, clean_gen_encoder, classifier)
-    audit_freeze_configuration(
-        args,
-        models,
-        projector,
-        token_projector,
-        clean_gen_encoder,
-        classifier,
-        optimizer,
-    )
     if args.scheduler == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -934,7 +844,6 @@ def main():
     print(f"encoder heads: {config['encoder_heads']}")
     print(f"use shared encoder: {args.use_clean_gen_encoder}")
     print(f"z hidden dim: {z_hidden_dim}")
-    print(f"freeze encoder: {args.freeze_encoder}")
     print(f"label smoothing: {args.label_smoothing}")
     print(f"sharing num: {args.sharing_num}")
     print(f"cls gamma init: {args.cls_gamma_init}")

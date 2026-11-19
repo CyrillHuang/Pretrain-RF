@@ -343,25 +343,9 @@ def pool_feature_maps(models, wifi_map, rfid_map, mmwave_map):
     rfid_feature = models[1].backbone.avg_pool(rfid_map).flatten(1)
     mmwave_feature = models[2].backbone.avgpool(mmwave_map).flatten(1)
     return wifi_feature, rfid_feature, mmwave_feature
-def forward_projected_inputs(models, projector, samples_wifi, samples_rfid, samples_mmwave, freeze_backbone=False):
-    if freeze_backbone:
-        with torch.no_grad():
-            wifi_map, rfid_map, mmwave_map = forward_feature_maps(
-                models,
-                samples_wifi,
-                samples_rfid,
-                samples_mmwave,
-            )
-            pooled_features = pool_feature_maps(models, wifi_map, rfid_map, mmwave_map)
-    else:
-        wifi_map, rfid_map, mmwave_map = forward_feature_maps(
-            models,
-            samples_wifi,
-            samples_rfid,
-            samples_mmwave,
-        )
-        pooled_features = pool_feature_maps(models, wifi_map, rfid_map, mmwave_map)
-
+def forward_projected_inputs(models, projector, samples_wifi, samples_rfid, samples_mmwave):
+    wifi_map, rfid_map, mmwave_map = forward_feature_maps(models, samples_wifi, samples_rfid, samples_mmwave)
+    pooled_features = pool_feature_maps(models, wifi_map, rfid_map, mmwave_map)
     model_zs = projector(*pooled_features)
     return model_zs, wifi_map, rfid_map, mmwave_map
 def make_loader(dataset, args, shuffle, drop_last=False):
@@ -376,10 +360,6 @@ def make_loader(dataset, args, shuffle, drop_last=False):
 def set_mode(modules, train):
     for module in modules:
         module.train(train)
-def set_requires_grad(modules, requires_grad):
-    for module in modules:
-        for param in module.parameters():
-            param.requires_grad = requires_grad
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -575,60 +555,6 @@ def encode_tokens(clean_gen_encoder, raw_tokens):
     return clean_gen_encoder(raw_tokens)
 
 
-def forward_encoded_inputs(
-    args,
-    models,
-    projector,
-    token_projector,
-    clean_gen_encoder,
-    samples_wifi,
-    samples_rfid,
-    samples_mmwave,
-):
-    if args.adapt_mode == "classifier":
-        with torch.no_grad():
-            wifi_map, rfid_map, mmwave_map = forward_feature_maps(
-                models,
-                samples_wifi,
-                samples_rfid,
-                samples_mmwave,
-            )
-            pooled_features = pool_feature_maps(models, wifi_map, rfid_map, mmwave_map)
-            model_zs = projector(*pooled_features)
-            raw_tokens = token_projector(wifi_map, rfid_map, mmwave_map)
-            encoded_tokens = encode_tokens(clean_gen_encoder, raw_tokens)
-        return model_zs, encoded_tokens
-
-    if args.adapt_mode == "projector_classifier":
-        with torch.no_grad():
-            wifi_map, rfid_map, mmwave_map = forward_feature_maps(
-                models,
-                samples_wifi,
-                samples_rfid,
-                samples_mmwave,
-            )
-            pooled_features = pool_feature_maps(models, wifi_map, rfid_map, mmwave_map)
-            raw_tokens = token_projector(wifi_map, rfid_map, mmwave_map)
-            encoded_tokens = encode_tokens(clean_gen_encoder, raw_tokens)
-        model_zs = projector(*[feature.detach() for feature in pooled_features])
-        return model_zs, encoded_tokens
-
-    if args.adapt_mode == "full":
-        wifi_map, rfid_map, mmwave_map = forward_feature_maps(
-            models,
-            samples_wifi,
-            samples_rfid,
-            samples_mmwave,
-        )
-        pooled_features = pool_feature_maps(models, wifi_map, rfid_map, mmwave_map)
-        model_zs = projector(*pooled_features)
-        raw_tokens = token_projector(wifi_map, rfid_map, mmwave_map)
-        encoded_tokens = encode_tokens(clean_gen_encoder, raw_tokens)
-        return model_zs, encoded_tokens
-
-    raise ValueError(f"unknown adapt_mode: {args.adapt_mode}")
-
-
 def module_list(models, projector, token_projector, clean_gen_encoder, classifier=None):
     modules = [*models, projector]
     if token_projector is not None:
@@ -640,63 +566,10 @@ def module_list(models, projector, token_projector, clean_gen_encoder, classifie
     return modules
 
 
-def configure_adaptation(args, models, projector, token_projector, clean_gen_encoder, classifier):
-    if args.adapt_mode == "classifier":
-        set_requires_grad(models, False)
-        set_requires_grad([projector], False)
-        if token_projector is not None:
-            set_requires_grad([token_projector], False)
-        if clean_gen_encoder is not None:
-            set_requires_grad([clean_gen_encoder], False)
-        set_requires_grad([classifier], True)
-        return list(classifier.parameters())
-    if args.adapt_mode == "projector_classifier":
-        set_requires_grad(models, False)
-        if token_projector is not None:
-            set_requires_grad([token_projector], False)
-        if clean_gen_encoder is not None:
-            set_requires_grad([clean_gen_encoder], False)
-        set_requires_grad([projector, classifier], True)
-        return list(projector.parameters()) + list(classifier.parameters())
-    if args.adapt_mode == "full":
-        set_requires_grad(module_list(models, projector, token_projector, clean_gen_encoder, classifier), True)
-        params = []
-        for model in models:
-            params.extend(model.parameters())
-        params.extend(projector.parameters())
-        if token_projector is not None:
-            params.extend(token_projector.parameters())
-        if clean_gen_encoder is not None:
-            params.extend(clean_gen_encoder.parameters())
-        params.extend(classifier.parameters())
-        return params
-    raise ValueError(f"unknown adapt_mode: {args.adapt_mode}")
-
-
 def build_optimizer(args, models, projector, token_projector, clean_gen_encoder, classifier):
-    if args.adapt_mode == "classifier":
-        return torch.optim.AdamW(
-            classifier.parameters(),
-            lr=args.head_lr,
-            weight_decay=args.weight_decay,
-        )
-    if args.adapt_mode == "projector_classifier":
-        return torch.optim.AdamW(
-            [
-                {"params": projector.parameters(), "lr": args.lr},
-                {"params": classifier.parameters(), "lr": args.head_lr},
-            ],
-            weight_decay=args.weight_decay,
-        )
-
     pretrained_params = []
-    for model in models:
-        pretrained_params.extend(model.parameters())
-    pretrained_params.extend(projector.parameters())
-    if token_projector is not None:
-        pretrained_params.extend(token_projector.parameters())
-    if clean_gen_encoder is not None:
-        pretrained_params.extend(clean_gen_encoder.parameters())
+    for module in module_list(models, projector, token_projector, clean_gen_encoder):
+        pretrained_params.extend(module.parameters())
     return torch.optim.AdamW(
         [
             {"params": pretrained_params, "lr": args.lr},
@@ -717,28 +590,14 @@ def forward_logits(
     samples_rfid,
     samples_mmwave,
 ):
+    model_zs, wifi_map, rfid_map, mmwave_map = forward_projected_inputs(
+        models, projector, samples_wifi, samples_rfid, samples_mmwave
+    )
     if getattr(args, "legacy_featuremap_iin", False):
-        freeze_backbone = args.adapt_mode in ("classifier", "projector_classifier")
-        model_zs, wifi_map, rfid_map, mmwave_map = forward_projected_inputs(
-            models,
-            projector,
-            samples_wifi,
-            samples_rfid,
-            samples_mmwave,
-            freeze_backbone=freeze_backbone,
-        )
         return classifier(model_zs, wifi_map, rfid_map, mmwave_map, return_g=args.return_g)
 
-    model_zs, encoded_tokens = forward_encoded_inputs(
-        args,
-        models,
-        projector,
-        token_projector,
-        clean_gen_encoder,
-        samples_wifi,
-        samples_rfid,
-        samples_mmwave,
-    )
+    raw_tokens = token_projector(wifi_map, rfid_map, mmwave_map)
+    encoded_tokens = encode_tokens(clean_gen_encoder, raw_tokens)
     return classifier(model_zs, encoded_tokens, return_g=args.return_g)
 
 
@@ -754,18 +613,7 @@ def train_one_epoch(
     optimizer,
     criterion,
 ):
-    if args.adapt_mode == "classifier":
-        set_mode(module_list(models, projector, token_projector, clean_gen_encoder), False)
-        set_mode([classifier], True)
-    elif args.adapt_mode == "projector_classifier":
-        set_mode(models, False)
-        if token_projector is not None:
-            set_mode([token_projector], False)
-        if clean_gen_encoder is not None:
-            set_mode([clean_gen_encoder], False)
-        set_mode([projector, classifier], True)
-    else:
-        set_mode(module_list(models, projector, token_projector, clean_gen_encoder, classifier), True)
+    set_mode(module_list(models, projector, token_projector, clean_gen_encoder, classifier), True)
 
     total_loss = 0.0
     total_correct = 0
@@ -868,7 +716,7 @@ def parse_args():
     parser.add_argument("--split_dir", type=str, default="", help="Direct path to a split dir with train_data/test_data")
     parser.add_argument("--eval_split_dir", type=str, default="", help="For zeroshot: evaluate a split dir's test_data")
     parser.add_argument("--txt_name", type=str, default="dml")
-    parser.add_argument("--adapt_mode", type=str, default="full", choices=("classifier", "projector_classifier", "full"))
+    parser.add_argument("--adapt_mode", choices=("full",), default="full", help=argparse.SUPPRESS)
     parser.add_argument("--adapt_epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=12)
@@ -960,7 +808,6 @@ def main():
     train_dataset, test_dataset = build_few_shot_datasets(args)
     train_loader = make_loader(train_dataset, args, shuffle=True)
     test_loader = make_loader(test_dataset, args, shuffle=False)
-    configure_adaptation(args, models, projector, token_projector, clean_gen_encoder, classifier)
     optimizer = build_optimizer(args, models, projector, token_projector, clean_gen_encoder, classifier)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,

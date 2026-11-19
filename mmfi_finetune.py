@@ -309,27 +309,15 @@ def load_pretrain(path, device, modules):
     return checkpoint
 
 
-def set_requires_grad(modules, value):
-    for module in modules:
-        for parameter in module.parameters():
-            parameter.requires_grad_(value)
-
-
 def build_optimizer(args, modules):
     wifi_encoder, mmwave_encoder, projector, token_projector, token_encoder, classifier = modules
-    downstream = list(projector.parameters()) + list(token_projector.parameters())
-    downstream += list(token_encoder.parameters())
-    if args.freeze_encoder:
-        groups = [
-            {"params": downstream, "lr": args.lr},
-            {"params": classifier.parameters(), "lr": args.head_lr},
-        ]
-    else:
-        pretrained = list(wifi_encoder.parameters()) + list(mmwave_encoder.parameters()) + downstream
-        groups = [
-            {"params": pretrained, "lr": args.lr},
-            {"params": classifier.parameters(), "lr": args.head_lr},
-        ]
+    pretrained = list(wifi_encoder.parameters()) + list(mmwave_encoder.parameters())
+    pretrained += list(projector.parameters()) + list(token_projector.parameters())
+    pretrained += list(token_encoder.parameters())
+    groups = [
+        {"params": pretrained, "lr": args.lr},
+        {"params": classifier.parameters(), "lr": args.head_lr},
+    ]
     return torch.optim.AdamW(groups, weight_decay=args.weight_decay)
 
 
@@ -402,7 +390,6 @@ def main():
     parser.add_argument("--generator_dropout", type=float, default=0.1)
     parser.add_argument("--cls_gamma_init", type=float, default=0.1)
     parser.add_argument("--add_modality_embed", action="store_true")
-    parser.add_argument("--freeze_encoder", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--device", default="cuda:0")
@@ -412,8 +399,6 @@ def main():
         parser.error("--no_pretrain and --pretrain_ckpt cannot be used together")
     if not args.no_pretrain and not args.pretrain_ckpt:
         parser.error("provide --pretrain_ckpt or use --no_pretrain")
-    if args.no_pretrain and args.freeze_encoder:
-        parser.error("--freeze_encoder requires a pre-trained checkpoint")
 
     seed_all(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -453,24 +438,17 @@ def main():
     modules = make_components(args, device)
     if not args.no_pretrain:
         load_pretrain(args.pretrain_ckpt, device, modules)
-    if args.freeze_encoder:
-        set_requires_grad(modules[:2], False)
 
     optimizer = build_optimizer(args, modules)
     scheduler = build_scheduler(args, optimizer)
     best_accuracy = -1.0
     print(f"train samples: {len(train_set)} test samples: {len(test_set)}", flush=True)
     print(f"device: {device} scheduler: {args.scheduler}", flush=True)
-    print(f"freeze ResNet backbones: {args.freeze_encoder}", flush=True)
 
     wifi_encoder, mmwave_encoder, projector, token_projector, token_encoder, classifier = modules
     for epoch in range(args.epochs):
-        wifi_encoder.train(not args.freeze_encoder)
-        mmwave_encoder.train(not args.freeze_encoder)
-        projector.train()
-        token_projector.train()
-        token_encoder.train()
-        classifier.train()
+        for module in modules:
+            module.train()
         running_loss = 0.0
         correct = 0
         total = 0
